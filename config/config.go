@@ -1,249 +1,249 @@
 package config
 
 import (
+	_ "embed"
 	"fmt"
-	"path"
 	"regexp"
-	"strconv"
+	"strings"
 
-	"github.com/zricethezav/gitleaks/v6/options"
-
-	"github.com/BurntSushi/toml"
-	log "github.com/sirupsen/logrus"
+	"github.com/rs/zerolog/log"
+	"github.com/spf13/viper"
 )
 
-// AllowList is struct containing items that if encountered will allowlist
-// a commit/line of code that would be considered a leak.
-type AllowList struct {
+//go:embed gitleaks.toml
+var DefaultConfig string
+
+// use to keep track of how many configs we can extend
+// yea I know, globals bad
+var extendDepth int
+
+const maxExtendDepth = 2
+
+// ViperConfig is the config struct used by the Viper config package
+// to parse the config file. This struct does not include regular expressions.
+// It is used as an intermediary to convert the Viper config to the Config struct.
+type ViperConfig struct {
 	Description string
-	Regexes     []*regexp.Regexp
-	Commits     []string
-	Files       []*regexp.Regexp
-	Paths       []*regexp.Regexp
-	Repos       []*regexp.Regexp
-}
-
-// Entropy represents an entropy range
-type Entropy struct {
-	Min   float64
-	Max   float64
-	Group int
-}
-
-// Rule is a struct that contains information that is loaded from a gitleaks config.
-// This struct is used in the Config struct as an array of Rules and is iterated
-// over during an scan. Each rule will be checked. If a regex match is found AND
-// that match is not allowlisted (globally or locally), then a leak will be appended
-// to the final scan report.
-type Rule struct {
-	Description string
-	Regex       *regexp.Regexp
-	File        *regexp.Regexp
-	Path        *regexp.Regexp
-	Tags        []string
-	AllowList   AllowList
-	Entropies   []Entropy
-}
-
-// Config is a composite struct of Rules and Allowlists
-// Each Rule contains a description, regular expression, tags, and allowlists if available
-type Config struct {
-	Rules     []Rule
-	Allowlist AllowList
-}
-
-// TomlAllowList is a struct used in the TomlLoader that loads in allowlists from
-// specific rules or globally at the top level config
-type TomlAllowList struct {
-	Description string
-	Regexes     []string
-	Commits     []string
-	Files       []string
-	Paths       []string
-	Repos       []string
-}
-
-// TomlLoader gets loaded with the values from a gitleaks toml config
-// see the config in config/defaults.go for an example. TomlLoader is used
-// to generate Config values (compiling regexes, etc).
-type TomlLoader struct {
-	AllowList TomlAllowList
-	Rules     []struct {
+	Extend      Extend
+	Rules       []struct {
+		ID          string
 		Description string
+		Entropy     float64
+		SecretGroup int
 		Regex       string
-		File        string
+		Keywords    []string
 		Path        string
 		Tags        []string
-		Entropies   []struct {
-			Min   string
-			Max   string
-			Group string
+
+		Allowlist struct {
+			Regexes   []string
+			Paths     []string
+			Commits   []string
+			StopWords []string
 		}
-		AllowList TomlAllowList
+	}
+	Allowlist struct {
+		Regexes   []string
+		Paths     []string
+		Commits   []string
+		StopWords []string
 	}
 }
 
-// NewConfig will create a new config struct which contains
-// rules on how gitleaks will proceed with its scan.
-// If no options are passed via cli then NewConfig will return
-// a default config which can be seen in config.go
-func NewConfig(options options.Options) (Config, error) {
-	var cfg Config
-	tomlLoader := TomlLoader{}
+// Config is a configuration struct that contains rules and an allowlist if present.
+type Config struct {
+	Extend      Extend
+	Path        string
+	Description string
+	Rules       map[string]Rule
+	Allowlist   Allowlist
+	Keywords    []string
 
-	var err error
-	if options.Config != "" {
-		_, err = toml.DecodeFile(options.Config, &tomlLoader)
-		// append a allowlist rule for allowlisting the config
-		tomlLoader.AllowList.Files = append(tomlLoader.AllowList.Files, path.Base(options.Config))
-	} else {
-		_, err = toml.Decode(DefaultConfig, &tomlLoader)
-	}
-	if err != nil {
-		return cfg, err
-	}
-
-	cfg, err = tomlLoader.Parse()
-	if err != nil {
-		return cfg, err
-	}
-
-	return cfg, nil
+	// used to keep sarif results consistent
+	orderedRules []string
 }
 
-// Parse will parse the values set in a TomlLoader and use those values
-// to create compiled regular expressions and rules used in scans
-func (tomlLoader TomlLoader) Parse() (Config, error) {
-	var cfg Config
-	for _, rule := range tomlLoader.Rules {
-		// check and make sure the rule is valid
-		if rule.Regex == "" && rule.Path == "" && rule.File == "" && len(rule.Entropies) == 0 {
-			log.Warnf("Rule %s does not define any actionable data", rule.Description)
-			continue
+// Extend is a struct that allows users to define how they want their
+// configuration extended by other configuration files.
+type Extend struct {
+	Path       string
+	URL        string
+	UseDefault bool
+}
+
+func (vc *ViperConfig) Translate() (Config, error) {
+	var (
+		keywords     []string
+		orderedRules []string
+	)
+	rulesMap := make(map[string]Rule)
+
+	for _, r := range vc.Rules {
+		var allowlistRegexes []*regexp.Regexp
+		for _, a := range r.Allowlist.Regexes {
+			allowlistRegexes = append(allowlistRegexes, regexp.MustCompile(a))
 		}
-		re, err := regexp.Compile(rule.Regex)
-		if err != nil {
-			return cfg, fmt.Errorf("problem loading config: %v", err)
-		}
-		fileNameRe, err := regexp.Compile(rule.File)
-		if err != nil {
-			return cfg, fmt.Errorf("problem loading config: %v", err)
-		}
-		filePathRe, err := regexp.Compile(rule.Path)
-		if err != nil {
-			return cfg, fmt.Errorf("problem loading config: %v", err)
+		var allowlistPaths []*regexp.Regexp
+		for _, a := range r.Allowlist.Paths {
+			allowlistPaths = append(allowlistPaths, regexp.MustCompile(a))
 		}
 
-		// rule specific allowlists
-		var allowList AllowList
-
-		// rule specific regexes
-		for _, re := range rule.AllowList.Regexes {
-			allowListedRegex, err := regexp.Compile(re)
-			if err != nil {
-				return cfg, fmt.Errorf("problem loading config: %v", err)
+		if r.Keywords == nil {
+			r.Keywords = []string{}
+		} else {
+			for _, k := range r.Keywords {
+				keywords = append(keywords, strings.ToLower(k))
 			}
-			allowList.Regexes = append(allowList.Regexes, allowListedRegex)
 		}
 
-		// rule specific filenames
-		for _, re := range rule.AllowList.Files {
-			allowListedRegex, err := regexp.Compile(re)
-			if err != nil {
-				return cfg, fmt.Errorf("problem loading config: %v", err)
-			}
-			allowList.Files = append(allowList.Files, allowListedRegex)
+		if r.Tags == nil {
+			r.Tags = []string{}
 		}
 
-		// rule specific paths
-		for _, re := range rule.AllowList.Paths {
-			allowListedRegex, err := regexp.Compile(re)
-			if err != nil {
-				return cfg, fmt.Errorf("problem loading config: %v", err)
-			}
-			allowList.Paths = append(allowList.Paths, allowListedRegex)
+		var configRegex *regexp.Regexp
+		var configPathRegex *regexp.Regexp
+		if r.Regex == "" {
+			configRegex = nil
+		} else {
+			configRegex = regexp.MustCompile(r.Regex)
 		}
-
-		var entropies []Entropy
-		for _, e := range rule.Entropies {
-			min, err := strconv.ParseFloat(e.Min, 64)
-			if err != nil {
-				return cfg, err
-			}
-			max, err := strconv.ParseFloat(e.Max, 64)
-			if err != nil {
-				return cfg, err
-			}
-			if e.Group == "" {
-				e.Group = "0"
-			}
-			group, err := strconv.ParseInt(e.Group, 10, 64)
-			if err != nil {
-				return cfg, err
-			} else if int(group) >= len(re.SubexpNames()) {
-				return cfg, fmt.Errorf("problem loading config: group cannot be higher than number of groups in regexp")
-			} else if group < 0 {
-				return cfg, fmt.Errorf("problem loading config: group cannot be lower than 0")
-			} else if min > 8.0 || min < 0.0 || max > 8.0 || max < 0.0 {
-				return cfg, fmt.Errorf("problem loading config: invalid entropy ranges, must be within 0.0-8.0")
-			} else if min > max {
-				return cfg, fmt.Errorf("problem loading config: entropy Min value cannot be higher than Max value")
-			}
-
-			entropies = append(entropies, Entropy{Min: min, Max: max, Group: int(group)})
+		if r.Path == "" {
+			configPathRegex = nil
+		} else {
+			configPathRegex = regexp.MustCompile(r.Path)
 		}
-
 		r := Rule{
-			Description: rule.Description,
-			Regex:       re,
-			File:        fileNameRe,
-			Path:        filePathRe,
-			Tags:        rule.Tags,
-			AllowList:   allowList,
-			Entropies:   entropies,
+			Description: r.Description,
+			RuleID:      r.ID,
+			Regex:       configRegex,
+			Path:        configPathRegex,
+			SecretGroup: r.SecretGroup,
+			Entropy:     r.Entropy,
+			Tags:        r.Tags,
+			Keywords:    r.Keywords,
+			Allowlist: Allowlist{
+				Regexes:   allowlistRegexes,
+				Paths:     allowlistPaths,
+				Commits:   r.Allowlist.Commits,
+				StopWords: r.Allowlist.StopWords,
+			},
 		}
+		orderedRules = append(orderedRules, r.RuleID)
 
-		cfg.Rules = append(cfg.Rules, r)
+		if r.Regex != nil && r.SecretGroup > r.Regex.NumSubexp() {
+			return Config{}, fmt.Errorf("%s invalid regex secret group %d, max regex secret group %d", r.Description, r.SecretGroup, r.Regex.NumSubexp())
+		}
+		rulesMap[r.RuleID] = r
+	}
+	var allowlistRegexes []*regexp.Regexp
+	for _, a := range vc.Allowlist.Regexes {
+		allowlistRegexes = append(allowlistRegexes, regexp.MustCompile(a))
+	}
+	var allowlistPaths []*regexp.Regexp
+	for _, a := range vc.Allowlist.Paths {
+		allowlistPaths = append(allowlistPaths, regexp.MustCompile(a))
+	}
+	c := Config{
+		Description: vc.Description,
+		Extend:      vc.Extend,
+		Rules:       rulesMap,
+		Allowlist: Allowlist{
+			Regexes:   allowlistRegexes,
+			Paths:     allowlistPaths,
+			Commits:   vc.Allowlist.Commits,
+			StopWords: vc.Allowlist.StopWords,
+		},
+		Keywords:     keywords,
+		orderedRules: orderedRules,
 	}
 
-	// global regex allowLists
-	for _, allowListRegex := range tomlLoader.AllowList.Regexes {
-		re, err := regexp.Compile(allowListRegex)
-		if err != nil {
-			return cfg, fmt.Errorf("problem loading config: %v", err)
+	if maxExtendDepth != extendDepth {
+		// disallow both usedefault and path from being set
+		if c.Extend.Path != "" && c.Extend.UseDefault {
+			log.Fatal().Msg("unable to load config due to extend.path and extend.useDefault being set")
 		}
-		cfg.Allowlist.Regexes = append(cfg.Allowlist.Regexes, re)
+		if c.Extend.UseDefault {
+			c.extendDefault()
+		} else if c.Extend.Path != "" {
+			c.extendPath()
+		}
+
 	}
 
-	// global file name allowLists
-	for _, allowListFileName := range tomlLoader.AllowList.Files {
-		re, err := regexp.Compile(allowListFileName)
-		if err != nil {
-			return cfg, fmt.Errorf("problem loading config: %v", err)
+	return c, nil
+}
+
+func (c *Config) OrderedRules() []Rule {
+	var orderedRules []Rule
+	for _, id := range c.orderedRules {
+		if _, ok := c.Rules[id]; ok {
+			orderedRules = append(orderedRules, c.Rules[id])
 		}
-		cfg.Allowlist.Files = append(cfg.Allowlist.Files, re)
+	}
+	return orderedRules
+}
+
+func (c *Config) extendDefault() {
+	extendDepth++
+	viper.SetConfigType("toml")
+	if err := viper.ReadConfig(strings.NewReader(DefaultConfig)); err != nil {
+		log.Fatal().Msgf("failed to load extended config, err: %s", err)
+		return
+	}
+	defaultViperConfig := ViperConfig{}
+	if err := viper.Unmarshal(&defaultViperConfig); err != nil {
+		log.Fatal().Msgf("failed to load extended config, err: %s", err)
+		return
+	}
+	cfg, err := defaultViperConfig.Translate()
+	if err != nil {
+		log.Fatal().Msgf("failed to load extended config, err: %s", err)
+		return
+	}
+	log.Debug().Msg("extending config with default config")
+	c.extend(cfg)
+
+}
+
+func (c *Config) extendPath() {
+	extendDepth++
+	viper.SetConfigFile(c.Extend.Path)
+	if err := viper.ReadInConfig(); err != nil {
+		log.Fatal().Msgf("failed to load extended config, err: %s", err)
+		return
+	}
+	extensionViperConfig := ViperConfig{}
+	if err := viper.Unmarshal(&extensionViperConfig); err != nil {
+		log.Fatal().Msgf("failed to load extended config, err: %s", err)
+		return
+	}
+	cfg, err := extensionViperConfig.Translate()
+	if err != nil {
+		log.Fatal().Msgf("failed to load extended config, err: %s", err)
+		return
+	}
+	log.Debug().Msgf("extending config with %s", c.Extend.Path)
+	c.extend(cfg)
+}
+
+func (c *Config) extendURL() {
+	// TODO
+}
+
+func (c *Config) extend(extensionConfig Config) {
+	for ruleID, rule := range extensionConfig.Rules {
+		if _, ok := c.Rules[ruleID]; !ok {
+			log.Trace().Msgf("adding %s to base config", ruleID)
+			c.Rules[ruleID] = rule
+			c.Keywords = append(c.Keywords, rule.Keywords...)
+		}
 	}
 
-	// global file path allowLists
-	for _, allowListFilePath := range tomlLoader.AllowList.Paths {
-		re, err := regexp.Compile(allowListFilePath)
-		if err != nil {
-			return cfg, fmt.Errorf("problem loading config: %v", err)
-		}
-		cfg.Allowlist.Paths = append(cfg.Allowlist.Paths, re)
-	}
-
-	// global repo allowLists
-	for _, allowListRepo := range tomlLoader.AllowList.Repos {
-		re, err := regexp.Compile(allowListRepo)
-		if err != nil {
-			return cfg, fmt.Errorf("problem loading config: %v", err)
-		}
-		cfg.Allowlist.Repos = append(cfg.Allowlist.Repos, re)
-	}
-
-	cfg.Allowlist.Commits = tomlLoader.AllowList.Commits
-	cfg.Allowlist.Description = tomlLoader.AllowList.Description
-
-	return cfg, nil
+	// append allowlists, not attempting to merge
+	c.Allowlist.Commits = append(c.Allowlist.Commits,
+		extensionConfig.Allowlist.Commits...)
+	c.Allowlist.Paths = append(c.Allowlist.Paths,
+		extensionConfig.Allowlist.Paths...)
+	c.Allowlist.Regexes = append(c.Allowlist.Regexes,
+		extensionConfig.Allowlist.Regexes...)
 }

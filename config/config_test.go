@@ -5,127 +5,144 @@ import (
 	"regexp"
 	"testing"
 
-	"github.com/zricethezav/gitleaks/v6/options"
+	"github.com/spf13/viper"
+	"github.com/stretchr/testify/assert"
 )
 
-func TestParse(t *testing.T) {
+const configPath = "../testdata/config/"
+
+func TestTranslate(t *testing.T) {
 	tests := []struct {
-		description   string
-		opts          options.Options
-		wantErr       error
-		wantFileRegex *regexp.Regexp
-		wantMessages  *regexp.Regexp
-		wantAllowlist AllowList
+		cfgName   string
+		cfg       Config
+		wantError error
 	}{
 		{
-			description: "default config",
-			opts:        options.Options{},
-		},
-		{
-			description: "test successful load",
-			opts: options.Options{
-				Config: "../test_data/test_configs/aws_key.toml",
+			cfgName: "allow_aws_re",
+			cfg: Config{
+				Rules: map[string]Rule{"aws-access-key": {
+					Description: "AWS Access Key",
+					Regex:       regexp.MustCompile("(A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}"),
+					Tags:        []string{"key", "AWS"},
+					Keywords:    []string{},
+					RuleID:      "aws-access-key",
+					Allowlist: Allowlist{
+						Regexes: []*regexp.Regexp{
+							regexp.MustCompile("AKIALALEMEL33243OLIA"),
+						},
+					},
+				},
+				},
 			},
 		},
 		{
-			description: "test bad toml",
-			opts: options.Options{
-				Config: "../test_data/test_configs/bad_aws_key.toml",
-			},
-			wantErr: fmt.Errorf("Near line 7 (last key parsed 'rules.description'): expected value but found \"AWS\" instead"),
-		},
-		{
-			description: "test bad regex",
-			opts: options.Options{
-				Config: "../test_data/test_configs/bad_regex_aws_key.toml",
-			},
-			wantErr: fmt.Errorf("problem loading config: error parsing regexp: invalid nested repetition operator: `???`"),
-		},
-		{
-			description: "test bad global allowlist file regex",
-			opts: options.Options{
-				Config: "../test_data/test_configs/bad_aws_key_global_allowlist_file.toml",
-			},
-			wantErr: fmt.Errorf("problem loading config: error parsing regexp: missing argument to repetition operator: `??`"),
-		},
-		{
-			description: "test bad global file regex",
-			opts: options.Options{
-				Config: "../test_data/test_configs/bad_aws_key_file_regex.toml",
-			},
-			wantErr: fmt.Errorf("problem loading config: error parsing regexp: missing argument to repetition operator: `??`"),
-		},
-		{
-			description: "test successful load big ol thing",
-			opts: options.Options{
-				Config: "../test_data/test_configs/large.toml",
+			cfgName: "allow_commit",
+			cfg: Config{
+				Rules: map[string]Rule{"aws-access-key": {
+					Description: "AWS Access Key",
+					Regex:       regexp.MustCompile("(A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}"),
+					Tags:        []string{"key", "AWS"},
+					Keywords:    []string{},
+					RuleID:      "aws-access-key",
+					Allowlist: Allowlist{
+						Commits: []string{"allowthiscommit"},
+					},
+				},
+				},
 			},
 		},
 		{
-			description: "test load entropy",
-			opts: options.Options{
-				Config: "../test_data/test_configs/entropy.toml",
+			cfgName: "allow_path",
+			cfg: Config{
+				Rules: map[string]Rule{"aws-access-key": {
+					Description: "AWS Access Key",
+					Regex:       regexp.MustCompile("(A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}"),
+					Tags:        []string{"key", "AWS"},
+					Keywords:    []string{},
+					RuleID:      "aws-access-key",
+					Allowlist: Allowlist{
+						Paths: []*regexp.Regexp{
+							regexp.MustCompile(".go"),
+						},
+					},
+				},
+				},
 			},
 		},
 		{
-			description: "test entropy bad range",
-			opts: options.Options{
-				Config: "../test_data/test_configs/bad_entropy_1.toml",
+			cfgName: "entropy_group",
+			cfg: Config{
+				Rules: map[string]Rule{"discord-api-key": {
+					Description: "Discord API key",
+					Regex:       regexp.MustCompile(`(?i)(discord[a-z0-9_ .\-,]{0,25})(=|>|:=|\|\|:|<=|=>|:).{0,5}['\"]([a-h0-9]{64})['\"]`),
+					RuleID:      "discord-api-key",
+					Allowlist:   Allowlist{},
+					Entropy:     3.5,
+					SecretGroup: 3,
+					Tags:        []string{},
+					Keywords:    []string{},
+				},
+				},
 			},
-			wantErr: fmt.Errorf("problem loading config: entropy Min value cannot be higher than Max value"),
 		},
 		{
-			description: "test entropy value max",
-			opts: options.Options{
-				Config: "../test_data/test_configs/bad_entropy_2.toml",
-			},
-			wantErr: fmt.Errorf("strconv.ParseFloat: parsing \"x\": invalid syntax"),
+			cfgName:   "bad_entropy_group",
+			cfg:       Config{},
+			wantError: fmt.Errorf("Discord API key invalid regex secret group 5, max regex secret group 3"),
 		},
 		{
-			description: "test entropy value min",
-			opts: options.Options{
-				Config: "../test_data/test_configs/bad_entropy_3.toml",
+			cfgName: "base",
+			cfg: Config{
+				Rules: map[string]Rule{
+					"aws-access-key": {
+						Description: "AWS Access Key",
+						Regex:       regexp.MustCompile("(A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}"),
+						Tags:        []string{"key", "AWS"},
+						Keywords:    []string{},
+						RuleID:      "aws-access-key",
+					},
+					"aws-secret-key": {
+						Description: "AWS Secret Key",
+						Regex:       regexp.MustCompile(`(?i)aws_(.{0,20})?=?.[\'\"0-9a-zA-Z\/+]{40}`),
+						Tags:        []string{"key", "AWS"},
+						Keywords:    []string{},
+						RuleID:      "aws-secret-key",
+					},
+					"aws-secret-key-again": {
+						Description: "AWS Secret Key",
+						Regex:       regexp.MustCompile(`(?i)aws_(.{0,20})?=?.[\'\"0-9a-zA-Z\/+]{40}`),
+						Tags:        []string{"key", "AWS"},
+						Keywords:    []string{},
+						RuleID:      "aws-secret-key-again",
+					},
+				},
 			},
-			wantErr: fmt.Errorf("strconv.ParseFloat: parsing \"x\": invalid syntax"),
-		},
-		{
-			description: "test entropy value group",
-			opts: options.Options{
-				Config: "../test_data/test_configs/bad_entropy_4.toml",
-			},
-			wantErr: fmt.Errorf("strconv.ParseInt: parsing \"x\": invalid syntax"),
-		},
-		{
-			description: "test entropy value group",
-			opts: options.Options{
-				Config: "../test_data/test_configs/bad_entropy_5.toml",
-			},
-			wantErr: fmt.Errorf("problem loading config: group cannot be lower than 0"),
-		},
-		{
-			description: "test entropy value group",
-			opts: options.Options{
-				Config: "../test_data/test_configs/bad_entropy_6.toml",
-			},
-			wantErr: fmt.Errorf("problem loading config: group cannot be higher than number of groups in regexp"),
-		},
-		{
-			description: "test entropy range limits",
-			opts: options.Options{
-				Config: "../test_data/test_configs/bad_entropy_7.toml",
-			},
-			wantErr: fmt.Errorf("problem loading config: invalid entropy ranges, must be within 0.0-8.0"),
 		},
 	}
 
-	for _, test := range tests {
-		_, err := NewConfig(test.opts)
+	for _, tt := range tests {
+		viper.Reset()
+		viper.AddConfigPath(configPath)
+		viper.SetConfigName(tt.cfgName)
+		viper.SetConfigType("toml")
+		err := viper.ReadInConfig()
 		if err != nil {
-			if test.wantErr == nil {
-				t.Error(test.description, err)
-			} else if test.wantErr.Error() != err.Error() {
-				t.Errorf("expected err: %s, got %s", test.wantErr, err)
-			}
+			t.Error(err)
 		}
+
+		var vc ViperConfig
+		err = viper.Unmarshal(&vc)
+		if err != nil {
+			t.Error(err)
+		}
+		cfg, err := vc.Translate()
+		if tt.wantError != nil {
+			if err == nil {
+				t.Errorf("expected error")
+			}
+			assert.Equal(t, tt.wantError, err)
+		}
+
+		assert.Equal(t, cfg.Rules, tt.cfg.Rules)
 	}
 }
